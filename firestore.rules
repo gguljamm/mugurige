@@ -1,0 +1,67 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function sameUser(userId) {
+      return signedIn() && request.auth.uid == userId;
+    }
+
+    function participantPath(roomId, userId) {
+      return /databases/$(database)/documents/rooms/$(roomId)/roomParticipants/$(userId);
+    }
+
+    function isParticipant(roomId) {
+      return signedIn() && exists(participantPath(roomId, request.auth.uid));
+    }
+
+    function isHost(roomId) {
+      return signedIn()
+        && get(/databases/$(database)/documents/rooms/$(roomId)).data.hostId == request.auth.uid;
+    }
+
+    match /users/{userId} {
+      allow read, create: if sameUser(userId);
+      allow update: if sameUser(userId)
+        && request.resource.data.monthlyCredits == resource.data.monthlyCredits
+        && request.resource.data.creditResetAt == resource.data.creditResetAt;
+    }
+
+    match /rooms/{roomId} {
+      // Room docs must remain readable to signed-in users so invite-code lookup works.
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.hostId == request.auth.uid;
+      allow update: if isHost(roomId);
+
+      match /roomParticipants/{participantId} {
+        allow read: if isParticipant(roomId) || isHost(roomId);
+        // Self-join for human users, plus host-created participant docs for AI slots.
+        allow create: if signedIn()
+          && (
+            participantId == request.auth.uid
+            || isHost(roomId)
+          );
+        allow update: if isHost(roomId);
+      }
+
+      match /chatMessages/{messageId} {
+        allow read: if isParticipant(roomId) || isHost(roomId);
+        allow create: if isParticipant(roomId)
+          && request.resource.data.authorId == request.auth.uid;
+      }
+
+      match /entries/{entryId} {
+        allow read: if isParticipant(roomId) || isHost(roomId);
+        allow create: if isParticipant(roomId);
+      }
+
+      match /gameSessions/{sessionId} {
+        allow read: if isParticipant(roomId) || isHost(roomId);
+        allow create, update: if isHost(roomId);
+      }
+    }
+  }
+}
