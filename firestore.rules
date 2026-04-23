@@ -35,6 +35,7 @@ service cloud.firestore {
       allow read: if signedIn();
       allow create: if signedIn() && request.resource.data.hostId == request.auth.uid;
       allow update: if isHost(roomId);
+      allow delete: if isHost(roomId);
 
       match /roomParticipants/{participantId} {
         allow read: if isParticipant(roomId) || isHost(roomId);
@@ -44,23 +45,46 @@ service cloud.firestore {
             participantId == request.auth.uid
             || isHost(roomId)
           );
-        allow update: if isHost(roomId);
+        allow update: if isHost(roomId)
+          || (
+            signedIn()
+            && participantId == request.auth.uid
+            && resource.data.id == request.auth.uid
+            && request.resource.data.id == request.auth.uid
+          );
+        allow delete: if isHost(roomId) || (signedIn() && participantId == request.auth.uid);
       }
 
       match /chatMessages/{messageId} {
         allow read: if isParticipant(roomId) || isHost(roomId);
-        allow create: if isParticipant(roomId)
-          && request.resource.data.authorId == request.auth.uid;
+        allow create: if (
+            isParticipant(roomId)
+            && request.resource.data.authorId == request.auth.uid
+          ) || (
+            isHost(roomId)
+            && request.resource.data.authorId == "system"
+          );
+        allow delete: if isHost(roomId);
       }
 
       match /entries/{entryId} {
         allow read: if isParticipant(roomId) || isHost(roomId);
-        allow create: if isParticipant(roomId);
+        allow create: if (
+            isParticipant(roomId)
+            && request.resource.data.authorId == request.auth.uid
+          ) || isHost(roomId);
+        allow update: if (
+            isParticipant(roomId)
+            && resource.data.authorId == request.auth.uid
+            && request.resource.data.authorId == request.auth.uid
+          ) || isHost(roomId);
+        allow delete: if isHost(roomId);
       }
 
       match /gameSessions/{sessionId} {
         allow read: if isParticipant(roomId) || isHost(roomId);
         allow create, update: if isHost(roomId);
+        allow delete: if isHost(roomId);
       }
     }
   }

@@ -3,10 +3,12 @@ export type GameMode = "relay" | "mafia" | "speed" | "aiVillain" | "blind";
 export type RoomStatus = "lobby" | "playing" | "results";
 
 export type EntryKind = "prompt" | "drawing" | "guess";
+export type PromptDifficulty = "easy" | "medium" | "hard";
 
 export interface UserProfile {
   id: string;
   displayName: string;
+  accountName?: string;
   photoUrl: string;
   monthlyCredits: number;
   creditResetAt: string;
@@ -14,7 +16,7 @@ export interface UserProfile {
 }
 
 export interface RoomSettings {
-  roundLimit: number;
+  promptDifficulty: PromptDifficulty;
 }
 
 export interface Room {
@@ -42,6 +44,10 @@ export interface GameSession {
   roomId: string;
   currentRound: number;
   totalRounds: number;
+  participantCount: number;
+  initialOffset: number;
+  stageStartedAt: number;
+  stageDurationSec: number;
   startedAt: number;
   completedAt?: number;
 }

@@ -1,32 +1,27 @@
-import { roomProgressText } from "../lib/game";
-import type { Participant, PersistedState, Room, UserProfile } from "../types";
+import type { Participant, PromptDifficulty, Room, UserProfile } from "../types";
 
 interface RoomPanelProps {
   activeRoom: Room | null;
   currentUser: UserProfile | null;
   participants: Participant[];
-  state: PersistedState;
   onAddAiParticipant: () => void;
   onCopyInviteLink?: () => void;
   onLeaveRoom: () => void;
   onReplayRoom?: () => void;
-  onEndRoom?: () => void;
   onStartGame: () => void;
-  onUpdateRoundLimit: (value: number) => void;
+  onUpdatePromptDifficulty: (difficulty: PromptDifficulty) => void;
 }
 
 export function RoomPanel({
   activeRoom,
   currentUser,
   participants,
-  state,
   onAddAiParticipant,
   onCopyInviteLink,
   onLeaveRoom,
   onReplayRoom,
-  onEndRoom,
   onStartGame,
-  onUpdateRoundLimit,
+  onUpdatePromptDifficulty,
 }: RoomPanelProps) {
   if (!activeRoom) {
     return (
@@ -63,14 +58,13 @@ export function RoomPanel({
             </button>
           </div>
         </div>
-        <div>
-          <strong>상태</strong>
-          <p>{roomProgressText(state, activeRoom.id)}</p>
-        </div>
       </div>
       <div className="participants">
         {participants.map((participant) => (
-          <div key={participant.id} className="participant-card">
+          <div
+            key={participant.id}
+            className={`participant-card ${participant.id === currentUser?.id ? "participant-card-self" : ""}`}
+          >
             <span
               className="participant-avatar"
               style={{ background: `linear-gradient(135deg, hsl(${participant.avatarHue} 80% 90%), white)` }}
@@ -78,7 +72,10 @@ export function RoomPanel({
               {participant.displayName.slice(0, 1)}
             </span>
             <div>
-              <strong>{participant.displayName}</strong>
+              <strong>
+                {participant.displayName}
+                {participant.id === currentUser?.id ? <span className="participant-self-badge">나</span> : null}
+              </strong>
               <p>{participant.isAi ? "AI 플레이어" : "실시간 참가자"}</p>
             </div>
           </div>
@@ -92,7 +89,7 @@ export function RoomPanel({
                   <p>{isHost && activeRoom.status === "lobby" ? "AI 참가자를 넣을 수 있어요" : "친구 입장 대기 중"}</p>
                 </div>
                 {isHost && activeRoom.status === "lobby" ? (
-                  <button className="secondary-button" onClick={onAddAiParticipant}>
+                  <button className="secondary-button ai-slot-button" onClick={onAddAiParticipant}>
                     AI 참가
                   </button>
                 ) : null}
@@ -104,34 +101,42 @@ export function RoomPanel({
         <div className="room-controls">
           {activeRoom.status === "lobby" ? (
             <>
-              <label>
-                라운드 수
-                <input
-                  type="range"
-                  min={3}
-                  max={8}
-                  value={activeRoom.settings.roundLimit}
-                  onChange={(event) => onUpdateRoundLimit(Number(event.target.value))}
-                />
-                <span>{activeRoom.settings.roundLimit} 라운드</span>
-              </label>
+              <div className="single-round-note">
+                <strong>게임 방식</strong>
+                <p>각자 다른 제시어를 받고, 한 바퀴 돌아 내 제시어가 다시 돌아오면 끝나요.</p>
+              </div>
+              <div className="difficulty-panel">
+                <strong>제시어 난이도</strong>
+                <div className="difficulty-actions">
+                  {(["easy", "medium", "hard"] as PromptDifficulty[]).map((difficulty) => (
+                    <button
+                      key={difficulty}
+                      className={`secondary-button difficulty-button ${activeRoom.settings.promptDifficulty === difficulty ? "difficulty-button-active" : ""}`}
+                      onClick={() => onUpdatePromptDifficulty(difficulty)}
+                    >
+                      {difficulty === "easy" ? "쉬움" : difficulty === "medium" ? "중간" : "어려움"}
+                    </button>
+                  ))}
+                </div>
+              </div>
               <div className="host-actions">
-                <button className="secondary-button" onClick={onAddAiParticipant}>
-                  AI 참가자 추가 (-1 credit)
-                </button>
-                <button className="primary-button" onClick={onStartGame} disabled={activeRoom.status !== "lobby"}>
-                  게임 시작
+                <button
+                  className="primary-button"
+                  onClick={onStartGame}
+                  disabled={activeRoom.status !== "lobby" || participants.length < 3}
+                >
+                  {participants.length < 3 ? `3명 모이면 시작` : "게임 시작"}
                 </button>
               </div>
             </>
           ) : null}
           {activeRoom.status === "results" ? (
             <div className="host-actions">
-              <button className="secondary-button" onClick={onReplayRoom}>
+              <button className="secondary-button" onClick={onStartGame}>
                 한 번 더하기
               </button>
-              <button className="primary-button" onClick={onEndRoom}>
-                종료하기
+              <button className="primary-button" onClick={onReplayRoom}>
+                나가기
               </button>
             </div>
           ) : null}

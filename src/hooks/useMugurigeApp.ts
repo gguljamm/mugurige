@@ -11,30 +11,38 @@ import {
   query,
   setDoc,
   updateDoc,
+  writeBatch,
   where,
 } from "firebase/firestore";
 import { httpsCallable } from "firebase/functions";
 import { onAuthStateChanged, signInWithPopup, signOut as firebaseSignOut } from "firebase/auth";
+import { getDownloadURL, ref, uploadString } from "firebase/storage";
 import {
   ensureMonthlyCredits,
+  getAssigneeForRound,
   getAssignmentsForParticipant,
   getCurrentUser,
+  getStageDurationSeconds,
+  getStageKind,
+  getTotalPlayableRounds,
   getRoomParticipants,
   initialState,
   makeAiDrawing,
   makeAiGuess,
-  makeAiPrompt,
+  pickPromptBatch,
   makeChatMessage,
   makeEntry,
   makeParticipant,
   makeRoom,
   makeUser,
   pickAiName,
+  sortParticipants,
 } from "../lib/game";
-import { firebaseAuth, firebaseConfigured, firebaseDb, firebaseFunctions, googleProvider } from "../lib/firebase";
-import type { Assignment, PersistedState } from "../types";
+import { firebaseAuth, firebaseConfigured, firebaseDb, firebaseFunctions, firebaseStorage, googleProvider } from "../lib/firebase";
+import type { Assignment, PersistedState, PromptDifficulty } from "../types";
 
 const STORAGE_KEY = "mugurige-mvp-state";
+const STAGE_FORCE_ADVANCE_GRACE_MS = 2000;
 
 function readState(): PersistedState {
   if (typeof window === "undefined") {
@@ -98,6 +106,14 @@ function writeInviteCodeToUrl(inviteCode: string | null) {
   window.history.replaceState({}, "", nextUrl);
 }
 
+function isLocalDevelopment() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  return ["localhost", "127.0.0.1"].includes(window.location.hostname);
+}
+
 function entryDocId(chainId: string, round: number) {
   return `${chainId}_${round}`;
 }
@@ -118,6 +134,14 @@ function upsertRoomState<T extends keyof PersistedState>(
   };
 }
 
+function mergeRoomEntry(
+  previousEntries: PersistedState["entriesByRoom"][string] | undefined,
+  nextEntry: PersistedState["entriesByRoom"][string][number],
+) {
+  const merged = [...(previousEntries ?? []).filter((entry) => entry.id !== nextEntry.id), nextEntry];
+  return merged.sort((a, b) => a.round - b.round || a.createdAt - b.createdAt);
+}
+
 function automateAiAndProgress(source: PersistedState, roomId: string): PersistedState {
   const nextState: PersistedState = structuredClone(source);
 
@@ -135,26 +159,23 @@ function automateAiAndProgress(source: PersistedState, roomId: string): Persiste
 
     for (let starterIndex = 0; starterIndex < participants.length; starterIndex += 1) {
       const starter = participants[starterIndex];
-      const assignee = participants[(starterIndex + session.currentRound) % participants.length];
+      const assignee = getAssigneeForRound(participants, starterIndex, session.currentRound, session.initialOffset);
       const currentEntry = entries.find(
         (entry) => entry.chainId === starter.id && entry.round === session.currentRound,
       );
 
-      if (!assignee.isAi || currentEntry) {
+      if (!assignee || !assignee.isAi || currentEntry) {
         continue;
       }
 
-      const previousEntry =
-        session.currentRound > 0
-          ? entries.find((entry) => entry.chainId === starter.id && entry.round === session.currentRound - 1)
-          : undefined;
-      const kind = session.currentRound === 0 ? "prompt" : session.currentRound % 2 === 1 ? "drawing" : "guess";
+      const previousEntry = entries.find(
+        (entry) => entry.chainId === starter.id && entry.round === session.currentRound - 1,
+      );
+      const kind = getStageKind(session.currentRound);
       const content =
-        kind === "prompt"
-          ? makeAiPrompt()
-          : kind === "drawing"
-            ? makeAiDrawing(previousEntry?.content ?? "상상 그림")
-            : makeAiGuess(previousEntry?.content ?? "");
+        kind === "drawing"
+          ? makeAiDrawing(previousEntry?.content ?? "상상 그림")
+          : makeAiGuess(previousEntry?.content ?? "");
 
       entries.push(
         makeEntry(roomId, starter.id, session.currentRound, kind, assignee.id, assignee.displayName, content),
@@ -164,7 +185,7 @@ function automateAiAndProgress(source: PersistedState, roomId: string): Persiste
 
     const roundEntries = entries.filter((entry) => entry.round === session.currentRound).length;
     if (roundEntries === participants.length) {
-      if (session.currentRound >= session.totalRounds - 1) {
+      if (session.currentRound >= session.totalRounds) {
         nextState.rooms[roomId] = {
           ...room,
           status: "results",
@@ -175,9 +196,12 @@ function automateAiAndProgress(source: PersistedState, roomId: string): Persiste
         };
         changed = true;
       } else {
+        const nextRound = session.currentRound + 1;
         nextState.sessionsByRoom[roomId] = {
           ...session,
-          currentRound: session.currentRound + 1,
+          currentRound: nextRound,
+          stageStartedAt: Date.now(),
+          stageDurationSec: getStageDurationSeconds(nextRound),
         };
         changed = true;
       }
@@ -198,6 +222,7 @@ export function useMugurigeApp() {
   const [pendingInviteCode, setPendingInviteCode] = useState<string | null>(() => readInviteCodeFromUrl());
   const [isAutoJoiningInvite, setIsAutoJoiningInvite] = useState(false);
   const [joinCode, setJoinCode] = useState("");
+  const [nicknameDraft, setNicknameDraft] = useState("");
   const [composer, setComposer] = useState("");
   const [toast, setToast] = useState<string | null>(null);
 
@@ -248,6 +273,28 @@ export function useMugurigeApp() {
       }
 
       const monthKey = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}`;
+      const userRef = doc(db, "users", authUser.uid);
+      let existingProfile: PersistedState["users"][string] | null = null;
+
+      try {
+        const existingSnapshot = await getDoc(userRef);
+        if (existingSnapshot.exists()) {
+          existingProfile = existingSnapshot.data() as PersistedState["users"][string];
+        }
+      } catch (error) {
+        console.error("auth:userRead", error);
+      }
+
+      const nextDisplayName =
+        existingProfile?.displayName
+        ?? authUser.displayName
+        ?? "머그리게 플레이어";
+      const nextAccountName =
+        existingProfile?.accountName
+        ?? authUser.displayName
+        ?? "Google User";
+      const nextMonthlyCredits = existingProfile?.monthlyCredits ?? 10;
+      const nextCreditResetAt = existingProfile?.creditResetAt ?? monthKey;
 
       setState((previous) => ({
         ...previous,
@@ -256,31 +303,32 @@ export function useMugurigeApp() {
           ...previous.users,
           [authUser.uid]: {
             id: authUser.uid,
-            displayName: authUser.displayName ?? "머그리게 플레이어",
+            displayName: nextDisplayName,
+            accountName: nextAccountName,
             photoUrl: authUser.photoURL ?? "",
-            monthlyCredits: previous.users[authUser.uid]?.monthlyCredits ?? 10,
-            creditResetAt: previous.users[authUser.uid]?.creditResetAt ?? monthKey,
+            monthlyCredits: nextMonthlyCredits,
+            creditResetAt: nextCreditResetAt,
             provider: "google",
           },
         },
       }));
 
-      const userRef = doc(db, "users", authUser.uid);
       try {
         await setDoc(
           userRef,
           {
             id: authUser.uid,
-            displayName: authUser.displayName ?? "머그리게 플레이어",
+            displayName: nextDisplayName,
+            accountName: nextAccountName,
             photoUrl: authUser.photoURL ?? "",
-            monthlyCredits: 10,
-            creditResetAt: monthKey,
+            monthlyCredits: nextMonthlyCredits,
+            creditResetAt: nextCreditResetAt,
             provider: "google",
           },
           { merge: true },
         );
 
-        if (firebaseFunctions) {
+        if (firebaseFunctions && !isLocalDevelopment()) {
           try {
             const syncCredits = httpsCallable(firebaseFunctions, "syncMonthlyCredits");
             await syncCredits();
@@ -338,17 +386,40 @@ export function useMugurigeApp() {
       return undefined;
     }
 
-    const roomRef = doc(firebaseDb, "rooms", activeRoomId);
+    const db = firebaseDb;
+    const roomRef = doc(db, "rooms", activeRoomId);
     const participantQuery = query(
-      collection(firebaseDb, "rooms", activeRoomId, "roomParticipants"),
+      collection(db, "rooms", activeRoomId, "roomParticipants"),
       orderBy("turnOrder", "asc"),
     );
-    const chatQuery = query(collection(firebaseDb, "rooms", activeRoomId, "chatMessages"), orderBy("createdAt", "asc"));
-    const entryQuery = query(collection(firebaseDb, "rooms", activeRoomId, "entries"), orderBy("round", "asc"));
+    const chatQuery = query(collection(db, "rooms", activeRoomId, "chatMessages"), orderBy("createdAt", "asc"));
+    const entryQuery = query(collection(db, "rooms", activeRoomId, "entries"), orderBy("round", "asc"));
 
     const offRoom = onSnapshot(roomRef, (snapshot) => {
       if (!snapshot.exists()) {
+        setState((previous) => {
+          const nextRooms = { ...previous.rooms };
+          const nextParticipants = { ...previous.participantsByRoom };
+          const nextMessages = { ...previous.messagesByRoom };
+          const nextEntries = { ...previous.entriesByRoom };
+          const nextSessions = { ...previous.sessionsByRoom };
+          delete nextRooms[activeRoomId];
+          delete nextParticipants[activeRoomId];
+          delete nextMessages[activeRoomId];
+          delete nextEntries[activeRoomId];
+          delete nextSessions[activeRoomId];
+          return {
+            ...previous,
+            rooms: nextRooms,
+            participantsByRoom: nextParticipants,
+            messagesByRoom: nextMessages,
+            entriesByRoom: nextEntries,
+            sessionsByRoom: nextSessions,
+            activeRoomId: null,
+          };
+        });
         setActiveRoomId(null);
+        setPendingInviteCode(null);
         return;
       }
 
@@ -360,7 +431,9 @@ export function useMugurigeApp() {
     });
 
     const offParticipants = onSnapshot(participantQuery, (snapshot) => {
-      const participants = snapshot.docs.map((item) => item.data() as PersistedState["participantsByRoom"][string][number]);
+      const participants = sortParticipants(
+        snapshot.docs.map((item) => item.data() as PersistedState["participantsByRoom"][string][number]),
+      );
       setState((previous) => ({
         ...upsertRoomState(previous, "participantsByRoom", activeRoomId, participants),
         activeRoomId,
@@ -383,17 +456,43 @@ export function useMugurigeApp() {
       }));
     });
 
-    const offSession = onSnapshot(doc(firebaseDb, "rooms", activeRoomId, "gameSessions", "current"), (snapshot) => {
-      if (!snapshot.exists()) {
-        return;
-      }
+    const offSession = onSnapshot(
+      doc(db, "rooms", activeRoomId, "gameSessions", "current"),
+      async (snapshot) => {
+        if (!snapshot.exists()) {
+          return;
+        }
 
-      const roomSession = snapshot.data() as PersistedState["sessionsByRoom"][string];
-      setState((previous) => ({
-        ...upsertRoomState(previous, "sessionsByRoom", activeRoomId, roomSession),
-        activeRoomId,
-      }));
-    });
+        const roomSession = snapshot.data() as PersistedState["sessionsByRoom"][string];
+
+        try {
+          const entrySnapshot = await getDocs(
+            query(collection(db, "rooms", activeRoomId, "entries"), orderBy("round", "asc")),
+          );
+          const roomEntries = entrySnapshot.docs.map(
+            (item) => item.data() as PersistedState["entriesByRoom"][string][number],
+          );
+
+          setState((previous) => ({
+            ...upsertRoomState(
+              upsertRoomState(previous, "entriesByRoom", activeRoomId, roomEntries),
+              "sessionsByRoom",
+              activeRoomId,
+              roomSession,
+            ),
+            activeRoomId,
+          }));
+          return;
+        } catch (error) {
+          console.error("session:entriesRefresh", error);
+        }
+
+        setState((previous) => ({
+          ...upsertRoomState(previous, "sessionsByRoom", activeRoomId, roomSession),
+          activeRoomId,
+        }));
+      },
+    );
 
     return () => {
       offRoom();
@@ -414,6 +513,7 @@ export function useMugurigeApp() {
   }, [toast]);
 
   const currentUser = getCurrentUser(state);
+  const currentActorId = firebaseAuth?.currentUser?.uid ?? state.currentUserId ?? currentUser?.id ?? null;
   const effectiveActiveRoomId = isFirebaseMode ? activeRoomId : state.activeRoomId;
   const activeRoom = effectiveActiveRoomId ? state.rooms[effectiveActiveRoomId] ?? null : null;
   const participants = activeRoom ? getRoomParticipants(state, activeRoom.id) : [];
@@ -421,13 +521,41 @@ export function useMugurigeApp() {
   const entries = activeRoom ? state.entriesByRoom[activeRoom.id] ?? [] : [];
   const messages = activeRoom ? state.messagesByRoom[activeRoom.id] ?? [] : [];
   const currentParticipant =
-    currentUser && activeRoom
-      ? participants.find((participant) => participant.id === currentUser.id && !participant.isAi) ?? null
+    currentActorId && activeRoom
+      ? participants.find((participant) => participant.id === currentActorId && !participant.isAi) ?? null
       : null;
   const assignments: Assignment[] = useMemo(
     () => (activeRoom && currentParticipant ? getAssignmentsForParticipant(state, activeRoom.id, currentParticipant.id) : []),
     [activeRoom, currentParticipant, state],
   );
+
+  useEffect(() => {
+    setNicknameDraft(currentUser?.displayName ?? "");
+  }, [currentUser?.displayName]);
+
+  useEffect(() => {
+    if (!activeRoom || !session || activeRoom.status !== "playing") {
+      return undefined;
+    }
+
+    const tick = window.setInterval(() => {
+      const expiresAt = session.stageStartedAt + session.stageDurationSec * 1000;
+      if (Date.now() < expiresAt + STAGE_FORCE_ADVANCE_GRACE_MS) {
+        return;
+      }
+
+      if (isFirebaseMode) {
+        if (currentUser?.id === activeRoom.hostId) {
+          void forceAdvanceFirebaseStage(activeRoom.id);
+        }
+        return;
+      }
+
+      forceAdvanceLocalStage(activeRoom.id);
+    }, 500);
+
+    return () => window.clearInterval(tick);
+  }, [activeRoom, currentUser?.id, isFirebaseMode, session]);
 
   useEffect(() => {
     if (activeRoom?.inviteCode) {
@@ -478,20 +606,38 @@ export function useMugurigeApp() {
 
       const room = roomSnapshot.docs[0].data() as PersistedState["rooms"][string];
       const participantRef = doc(firebaseDb, "rooms", room.id, "roomParticipants", actorId);
-      const nextParticipant = makeParticipant(room.id, actorDisplayName, false, Date.now(), actorId);
-      await setDoc(participantRef, nextParticipant, { merge: true });
-      await setDoc(
-        doc(collection(firebaseDb, "rooms", room.id, "chatMessages")),
-        makeChatMessage(room.id, actorId, "Mugurige", `${actorDisplayName} 님이 입장했어요.`),
-      );
+      const nextParticipant = makeParticipant(room.id, actorDisplayName, false, Date.now() + Math.random(), actorId);
+
+      try {
+        await setDoc(participantRef, nextParticipant, { merge: true });
+      } catch (error) {
+        console.error("joinRoom:participant", error);
+        throw error;
+      }
 
       setState((previous) => ({
         ...previous,
         activeRoomId: room.id,
+        participantsByRoom: {
+          ...previous.participantsByRoom,
+          [room.id]: previous.participantsByRoom[room.id]?.some((participant) => participant.id === actorId)
+            ? previous.participantsByRoom[room.id]
+            : [...(previous.participantsByRoom[room.id] ?? []), nextParticipant],
+        },
       }));
       setActiveRoomId(room.id);
       setJoinCode("");
       setPendingInviteCode(normalizedCode);
+
+      try {
+        await setDoc(
+          doc(collection(firebaseDb, "rooms", room.id, "chatMessages")),
+          makeChatMessage(room.id, actorId, actorDisplayName, `${actorDisplayName} 님이 입장했어요.`),
+        );
+      } catch (error) {
+        console.error("joinRoom:chat", error);
+      }
+
       return true;
     }
 
@@ -562,15 +708,16 @@ export function useMugurigeApp() {
       return;
     }
 
-    const roomRef = doc(firebaseDb, "rooms", roomId);
-    const sessionRef = doc(firebaseDb, "rooms", roomId, "gameSessions", "current");
+    const db = firebaseDb;
+    const roomRef = doc(db, "rooms", roomId);
+    const sessionRef = doc(db, "rooms", roomId, "gameSessions", "current");
 
     for (let pass = 0; pass < 40; pass += 1) {
       const [roomSnapshot, sessionSnapshot, participantSnapshot, entrySnapshot] = await Promise.all([
         getDoc(roomRef),
         getDoc(sessionRef),
-        getDocs(query(collection(firebaseDb, "rooms", roomId, "roomParticipants"), orderBy("turnOrder", "asc"))),
-        getDocs(query(collection(firebaseDb, "rooms", roomId, "entries"), orderBy("round", "asc"))),
+        getDocs(query(collection(db, "rooms", roomId, "roomParticipants"), orderBy("turnOrder", "asc"))),
+        getDocs(query(collection(db, "rooms", roomId, "entries"), orderBy("round", "asc"))),
       ]);
 
       if (!roomSnapshot.exists() || !sessionSnapshot.exists()) {
@@ -579,8 +726,8 @@ export function useMugurigeApp() {
 
       const room = roomSnapshot.data() as PersistedState["rooms"][string];
       const roomSession = sessionSnapshot.data() as PersistedState["sessionsByRoom"][string];
-      const roomParticipants = participantSnapshot.docs.map(
-        (item) => item.data() as PersistedState["participantsByRoom"][string][number],
+      const roomParticipants = sortParticipants(
+        participantSnapshot.docs.map((item) => item.data() as PersistedState["participantsByRoom"][string][number]),
       );
       const roomEntries = entrySnapshot.docs.map((item) => item.data() as PersistedState["entriesByRoom"][string][number]);
 
@@ -589,29 +736,32 @@ export function useMugurigeApp() {
       }
 
       let changed = false;
+      const batch = writeBatch(db);
 
       for (let starterIndex = 0; starterIndex < roomParticipants.length; starterIndex += 1) {
         const starter = roomParticipants[starterIndex];
-        const assignee = roomParticipants[(starterIndex + roomSession.currentRound) % roomParticipants.length];
+        const assignee = getAssigneeForRound(
+          roomParticipants,
+          starterIndex,
+          roomSession.currentRound,
+          roomSession.initialOffset,
+        );
         const currentEntry = roomEntries.find(
           (entry) => entry.chainId === starter.id && entry.round === roomSession.currentRound,
         );
 
-        if (!assignee.isAi || currentEntry) {
+        if (!assignee || !assignee.isAi || currentEntry) {
           continue;
         }
 
-        const previousEntry =
-          roomSession.currentRound > 0
-            ? roomEntries.find((entry) => entry.chainId === starter.id && entry.round === roomSession.currentRound - 1)
-            : undefined;
-        const kind = roomSession.currentRound === 0 ? "prompt" : roomSession.currentRound % 2 === 1 ? "drawing" : "guess";
+        const previousEntry = roomEntries.find(
+          (entry) => entry.chainId === starter.id && entry.round === roomSession.currentRound - 1,
+        );
+        const kind = getStageKind(roomSession.currentRound);
         const content =
-          kind === "prompt"
-            ? makeAiPrompt()
-            : kind === "drawing"
-              ? makeAiDrawing(previousEntry?.content ?? "상상 그림")
-              : makeAiGuess(previousEntry?.content ?? "");
+          kind === "drawing"
+            ? makeAiDrawing(previousEntry?.content ?? "상상 그림")
+            : makeAiGuess(previousEntry?.content ?? "");
         const nextEntry = makeEntry(
           roomId,
           starter.id,
@@ -623,21 +773,24 @@ export function useMugurigeApp() {
           entryDocId(starter.id, roomSession.currentRound),
         );
 
-        await setDoc(doc(firebaseDb, "rooms", roomId, "entries", nextEntry.id), nextEntry);
+        batch.set(doc(db, "rooms", roomId, "entries", nextEntry.id), nextEntry);
         roomEntries.push(nextEntry);
         changed = true;
       }
 
       const roundEntries = roomEntries.filter((entry) => entry.round === roomSession.currentRound).length;
       if (roundEntries === roomParticipants.length) {
-        if (roomSession.currentRound >= roomSession.totalRounds - 1) {
-          await Promise.all([
-            updateDoc(roomRef, { status: "results" }),
-            updateDoc(sessionRef, { completedAt: Date.now() }),
-          ]);
+        if (roomSession.currentRound >= roomSession.totalRounds) {
+          batch.update(roomRef, { status: "results" });
+          batch.update(sessionRef, { completedAt: Date.now() });
           changed = true;
         } else {
-          await updateDoc(sessionRef, { currentRound: roomSession.currentRound + 1 });
+          const nextRound = roomSession.currentRound + 1;
+          batch.update(sessionRef, {
+            currentRound: nextRound,
+            stageStartedAt: Date.now(),
+            stageDurationSec: getStageDurationSeconds(nextRound),
+          });
           changed = true;
         }
       }
@@ -645,7 +798,117 @@ export function useMugurigeApp() {
       if (!changed) {
         return;
       }
+
+      await batch.commit();
+      await syncFirebaseRoomState(roomId);
     }
+  }
+
+  async function syncFirebaseRoomState(roomId: string) {
+    if (!firebaseDb) {
+      return;
+    }
+
+    const db = firebaseDb;
+    const [roomSnapshot, sessionSnapshot, entrySnapshot] = await Promise.all([
+      getDoc(doc(db, "rooms", roomId)),
+      getDoc(doc(db, "rooms", roomId, "gameSessions", "current")).catch(() => null),
+      getDocs(query(collection(db, "rooms", roomId, "entries"), orderBy("round", "asc"))),
+    ]);
+
+    const room = roomSnapshot.exists() ? (roomSnapshot.data() as PersistedState["rooms"][string]) : null;
+    const roomSession =
+      sessionSnapshot && "exists" in sessionSnapshot && sessionSnapshot.exists()
+        ? (sessionSnapshot.data() as PersistedState["sessionsByRoom"][string])
+        : null;
+    const roomEntries = entrySnapshot.docs.map(
+      (item) => item.data() as PersistedState["entriesByRoom"][string][number],
+    );
+
+    setState((previous) => {
+      let nextState = upsertRoomState(previous, "entriesByRoom", roomId, roomEntries);
+
+      if (room) {
+        nextState = upsertRoomState(nextState, "rooms", roomId, room);
+      }
+
+      if (roomSession) {
+        nextState = upsertRoomState(nextState, "sessionsByRoom", roomId, roomSession);
+      }
+
+      return {
+        ...nextState,
+        activeRoomId: roomId,
+      };
+    });
+  }
+
+  async function forceAdvanceFirebaseStage(roomId: string) {
+    if (!firebaseDb) {
+      return;
+    }
+
+    const db = firebaseDb;
+    const roomRef = doc(db, "rooms", roomId);
+    const sessionRef = doc(db, "rooms", roomId, "gameSessions", "current");
+    const [roomSnapshot, sessionSnapshot, participantSnapshot, entrySnapshot] = await Promise.all([
+      getDoc(roomRef),
+      getDoc(sessionRef),
+      getDocs(query(collection(db, "rooms", roomId, "roomParticipants"), orderBy("turnOrder", "asc"))),
+      getDocs(query(collection(db, "rooms", roomId, "entries"), orderBy("round", "asc"))),
+    ]);
+
+    if (!roomSnapshot.exists() || !sessionSnapshot.exists()) {
+      return;
+    }
+
+    const room = roomSnapshot.data() as PersistedState["rooms"][string];
+    const roomSession = sessionSnapshot.data() as PersistedState["sessionsByRoom"][string];
+    const roomParticipants = sortParticipants(
+      participantSnapshot.docs.map((item) => item.data() as PersistedState["participantsByRoom"][string][number]),
+    );
+    const roomEntries = entrySnapshot.docs.map((item) => item.data() as PersistedState["entriesByRoom"][string][number]);
+
+    if (room.status !== "playing") {
+      return;
+    }
+
+    if (roomSession.currentRound === 0) {
+      const nextRound = 1;
+      const batch = writeBatch(db);
+      batch.update(sessionRef, {
+        currentRound: nextRound,
+        stageStartedAt: Date.now(),
+        stageDurationSec: getStageDurationSeconds(nextRound),
+      });
+      await batch.commit();
+      await syncFirebaseRoomState(roomId);
+      await processFirebaseRoom(roomId);
+      return;
+    }
+    const roundEntries = roomEntries.filter((entry) => entry.round === roomSession.currentRound).length;
+    if (roundEntries < roomParticipants.length) {
+      return;
+    }
+
+    const batch = writeBatch(db);
+    if (roomSession.currentRound >= roomSession.totalRounds) {
+      batch.update(roomRef, { status: "results" });
+      batch.update(sessionRef, { completedAt: Date.now() });
+      await batch.commit();
+      await syncFirebaseRoomState(roomId);
+      return;
+    }
+
+    const nextRound = roomSession.currentRound + 1;
+    batch.update(sessionRef, {
+      currentRound: nextRound,
+      stageStartedAt: Date.now(),
+      stageDurationSec: getStageDurationSeconds(nextRound),
+    });
+    await batch.commit();
+    await syncFirebaseRoomState(roomId);
+    await processFirebaseRoom(roomId);
   }
 
   function patchState(recipe: (draft: PersistedState) => PersistedState | void) {
@@ -653,6 +916,52 @@ export function useMugurigeApp() {
       const draft = structuredClone(previous);
       const result = recipe(draft);
       return result ?? draft;
+    });
+  }
+
+  function forceAdvanceLocalStage(roomId: string) {
+    patchState((draft) => {
+      const room = draft.rooms[roomId];
+      const roomSession = draft.sessionsByRoom[roomId];
+      const roomParticipants = getRoomParticipants(draft, roomId);
+      const roomEntries = draft.entriesByRoom[roomId] ?? [];
+
+      if (!room || !roomSession || room.status !== "playing") {
+        return draft;
+      }
+
+      if (roomSession.currentRound === 0) {
+        const nextRound = 1;
+        draft.sessionsByRoom[roomId] = {
+          ...roomSession,
+          currentRound: nextRound,
+          stageStartedAt: Date.now(),
+          stageDurationSec: getStageDurationSeconds(nextRound),
+        };
+        return automateAiAndProgress(draft, roomId);
+      }
+      const roundEntries = roomEntries.filter((entry) => entry.round === roomSession.currentRound).length;
+      if (roundEntries < roomParticipants.length) {
+        return draft;
+      }
+
+      if (roomSession.currentRound >= roomSession.totalRounds) {
+        draft.rooms[roomId].status = "results";
+        draft.sessionsByRoom[roomId] = {
+          ...roomSession,
+          completedAt: Date.now(),
+        };
+        return draft;
+      }
+
+      const nextRound = roomSession.currentRound + 1;
+      draft.sessionsByRoom[roomId] = {
+        ...roomSession,
+        currentRound: nextRound,
+        stageStartedAt: Date.now(),
+        stageDurationSec: getStageDurationSeconds(nextRound),
+      };
+      return automateAiAndProgress(draft, roomId);
     });
   }
 
@@ -686,6 +995,61 @@ export function useMugurigeApp() {
       draft.currentUserId = null;
       draft.activeRoomId = null;
     });
+  }
+
+  async function saveNickname() {
+    const nextName = nicknameDraft.trim();
+    if (!currentUser || !nextName) {
+      setToast("닉네임을 입력해 주세요");
+      return;
+    }
+
+    if (nextName === currentUser.displayName) {
+      setToast("이미 적용된 닉네임이에요");
+      return;
+    }
+
+    if (isFirebaseMode && firebaseDb) {
+      try {
+        await setDoc(
+          doc(firebaseDb, "users", currentUser.id),
+          {
+            displayName: nextName,
+          },
+          { merge: true },
+        );
+
+        if (activeRoom) {
+          await setDoc(
+            doc(firebaseDb, "rooms", activeRoom.id, "roomParticipants", currentUser.id),
+            {
+              displayName: nextName,
+            },
+            { merge: true },
+          ).catch(() => undefined);
+        }
+
+        setToast("닉네임을 저장했어요");
+      } catch (error) {
+        console.error("saveNickname", error);
+        setToast("닉네임 저장 중 문제가 생겼어요");
+      }
+      return;
+    }
+
+    patchState((draft) => {
+      draft.users[currentUser.id] = {
+        ...draft.users[currentUser.id],
+        displayName: nextName,
+      };
+
+      if (activeRoom) {
+        draft.participantsByRoom[activeRoom.id] = (draft.participantsByRoom[activeRoom.id] ?? []).map((participant) =>
+          participant.id === currentUser.id ? { ...participant, displayName: nextName } : participant,
+        );
+      }
+    });
+    setToast("닉네임을 저장했어요");
   }
 
   async function createRoom() {
@@ -800,7 +1164,7 @@ export function useMugurigeApp() {
     });
   }
 
-  async function updateRoundLimit(nextValue: number) {
+  async function updatePromptDifficulty(nextDifficulty: PromptDifficulty) {
     if (!activeRoom || !currentUser || activeRoom.hostId !== currentUser.id) {
       return;
     }
@@ -809,14 +1173,14 @@ export function useMugurigeApp() {
       await updateDoc(doc(firebaseDb, "rooms", activeRoom.id), {
         settings: {
           ...activeRoom.settings,
-          roundLimit: nextValue,
+          promptDifficulty: nextDifficulty,
         },
       });
       return;
     }
 
     patchState((draft) => {
-      draft.rooms[activeRoom.id].settings.roundLimit = nextValue;
+      draft.rooms[activeRoom.id].settings.promptDifficulty = nextDifficulty;
     });
   }
 
@@ -837,12 +1201,12 @@ export function useMugurigeApp() {
         }
       }
 
-      const aiParticipant = makeParticipant(activeRoom.id, pickAiName(), true, Date.now());
+      const aiParticipant = makeParticipant(activeRoom.id, pickAiName(), true, Date.now() + Math.random());
       await Promise.all([
         setDoc(doc(firebaseDb, "rooms", activeRoom.id, "roomParticipants", aiParticipant.id), aiParticipant),
         setDoc(
           doc(collection(firebaseDb, "rooms", activeRoom.id, "chatMessages")),
-          makeChatMessage(activeRoom.id, currentUser.id, "Mugurige", `${aiParticipant.displayName} 가 합류했어요. (-1 credit)`),
+          makeChatMessage(activeRoom.id, "system", "Mugurige", `${aiParticipant.displayName} 가 합류했어요. (-1 credit)`),
         ),
       ]);
       setToast("AI 참가자를 추가했어요");
@@ -882,44 +1246,111 @@ export function useMugurigeApp() {
       return;
     }
 
-    if (isFirebaseMode && firebaseDb) {
-      await Promise.all([
-        updateDoc(doc(firebaseDb, "rooms", activeRoom.id), { status: "playing" }),
-        setDoc(doc(firebaseDb, "rooms", activeRoom.id, "gameSessions", "current"), {
-          roomId: activeRoom.id,
-          currentRound: 0,
-          totalRounds: Math.min(activeRoom.settings.roundLimit, participants.length),
-          startedAt: Date.now(),
-        }),
-        setDoc(
-          doc(collection(firebaseDb, "rooms", activeRoom.id, "chatMessages")),
-          makeChatMessage(activeRoom.id, currentUser.id, "Mugurige", "릴레이 게임이 시작됐어요. 첫 제시어를 적어 주세요!"),
+    try {
+      const participantCount = roomParticipants.length;
+      const initialOffset = participantCount % 2 === 0 ? 0 : 1;
+      const totalRounds = getTotalPlayableRounds(participantCount);
+      const initialRound = 0;
+      const promptBatch = pickPromptBatch(activeRoom.settings.promptDifficulty, participantCount);
+      const promptEntries = roomParticipants.map((starter, starterIndex) =>
+        makeEntry(
+          activeRoom.id,
+          starter.id,
+          0,
+          "prompt",
+          starter.id,
+          starter.displayName,
+          promptBatch[starterIndex],
+          entryDocId(starter.id, 0),
         ),
-      ]);
-      await processFirebaseRoom(activeRoom.id);
-      return;
+      );
+
+      if (isFirebaseMode && firebaseDb) {
+        const db = firebaseDb;
+        const existingEntrySnapshot = await getDocs(collection(db, "rooms", activeRoom.id, "entries"));
+        const nextSession = {
+          roomId: activeRoom.id,
+          currentRound: initialRound,
+          totalRounds,
+          participantCount,
+          initialOffset,
+          stageStartedAt: Date.now(),
+          stageDurationSec: getStageDurationSeconds(initialRound),
+          startedAt: Date.now(),
+        };
+        const startMessage = makeChatMessage(
+          activeRoom.id,
+          "system",
+          "Mugurige",
+          "릴레이 게임이 시작됐어요. 각자 받은 단서로 첫 그림을 그려 주세요!",
+        );
+        const batch = writeBatch(db);
+        const startMessageRef = doc(collection(db, "rooms", activeRoom.id, "chatMessages"));
+
+        existingEntrySnapshot.docs.forEach((item) => {
+          batch.delete(item.ref);
+        });
+        batch.update(doc(db, "rooms", activeRoom.id), { status: "playing" });
+        batch.set(doc(db, "rooms", activeRoom.id, "gameSessions", "current"), nextSession);
+        promptEntries.forEach((entry) => {
+          batch.set(doc(db, "rooms", activeRoom.id, "entries", entry.id), entry);
+        });
+        batch.set(startMessageRef, startMessage);
+        await batch.commit();
+        setState((previous) => ({
+          ...previous,
+          rooms: {
+            ...previous.rooms,
+            [activeRoom.id]: {
+              ...activeRoom,
+              status: "playing",
+            },
+          },
+          entriesByRoom: {
+            ...previous.entriesByRoom,
+            [activeRoom.id]: promptEntries,
+          },
+          sessionsByRoom: {
+            ...previous.sessionsByRoom,
+            [activeRoom.id]: nextSession,
+          },
+          messagesByRoom: {
+            ...previous.messagesByRoom,
+            [activeRoom.id]: [...(previous.messagesByRoom[activeRoom.id] ?? []), startMessage],
+          },
+        }));
+
+        return;
+      }
+
+      patchState((draft) => {
+        const room = draft.rooms[activeRoom.id];
+        draft.rooms[activeRoom.id] = {
+          ...room,
+          status: "playing",
+        };
+        draft.entriesByRoom[activeRoom.id] = promptEntries;
+        draft.sessionsByRoom[activeRoom.id] = {
+          roomId: activeRoom.id,
+          currentRound: initialRound,
+          totalRounds,
+          participantCount,
+          initialOffset,
+          stageStartedAt: Date.now(),
+          stageDurationSec: getStageDurationSeconds(initialRound),
+          startedAt: Date.now(),
+        };
+        draft.messagesByRoom[activeRoom.id] = [
+          ...(draft.messagesByRoom[activeRoom.id] ?? []),
+          makeChatMessage(activeRoom.id, "system", "Mugurige", "릴레이 게임이 시작됐어요. 각자 받은 단서로 첫 그림을 그려 주세요!"),
+        ];
+
+        return draft;
+      });
+    } catch (error) {
+      console.error("startGame", error);
+      setToast("게임 시작 중 문제가 생겼어요");
     }
-
-    patchState((draft) => {
-      const room = draft.rooms[activeRoom.id];
-      draft.rooms[activeRoom.id] = {
-        ...room,
-        status: "playing",
-      };
-      draft.entriesByRoom[activeRoom.id] = [];
-      draft.sessionsByRoom[activeRoom.id] = {
-        roomId: activeRoom.id,
-        currentRound: 0,
-        totalRounds: Math.min(room.settings.roundLimit, draft.participantsByRoom[activeRoom.id].length),
-        startedAt: Date.now(),
-      };
-      draft.messagesByRoom[activeRoom.id] = [
-        ...(draft.messagesByRoom[activeRoom.id] ?? []),
-        makeChatMessage(activeRoom.id, "system", "Mugurige", "릴레이 게임이 시작됐어요. 첫 제시어를 적어 주세요!"),
-      ];
-
-      return automateAiAndProgress(draft, activeRoom.id);
-    });
   }
 
   async function submitTextAssignment(content: string) {
@@ -927,32 +1358,15 @@ export function useMugurigeApp() {
       return;
     }
 
-    const assignment = assignments.find((item) => !item.currentEntry);
+    const assignment = assignments.find((item) => !item.currentEntry) ?? assignments[0];
     if (!assignment) {
       setToast("현재 제출할 차례가 없어요");
       return;
     }
 
-    if (isFirebaseMode && firebaseDb) {
-      const entry = makeEntry(
-        activeRoom.id,
-        assignment.chainId,
-        assignment.round,
-        assignment.kind,
-        currentParticipant.id,
-        currentParticipant.displayName,
-        content,
-        entryDocId(assignment.chainId, assignment.round),
-      );
-      await setDoc(doc(firebaseDb, "rooms", activeRoom.id, "entries", entry.id), entry);
-      await processFirebaseRoom(activeRoom.id);
-      return;
-    }
-
-    patchState((draft) => {
-      draft.entriesByRoom[activeRoom.id] = [
-        ...(draft.entriesByRoom[activeRoom.id] ?? []),
-        makeEntry(
+    try {
+      if (isFirebaseMode && firebaseDb) {
+        const entry = makeEntry(
           activeRoom.id,
           assignment.chainId,
           assignment.round,
@@ -960,11 +1374,62 @@ export function useMugurigeApp() {
           currentParticipant.id,
           currentParticipant.displayName,
           content,
-        ),
-      ];
+          entryDocId(assignment.chainId, assignment.round),
+        );
+        const entryRef = doc(firebaseDb, "rooms", activeRoom.id, "entries", entry.id);
+        await setDoc(entryRef, entry);
+        setState((previous) => ({
+          ...previous,
+          entriesByRoom: {
+            ...previous.entriesByRoom,
+            [activeRoom.id]: mergeRoomEntry(previous.entriesByRoom[activeRoom.id], entry),
+          },
+        }));
+        await processFirebaseRoom(activeRoom.id);
 
-      return automateAiAndProgress(draft, activeRoom.id);
-    });
+        if (assignment.kind === "drawing" && firebaseStorage) {
+          try {
+            const storageRef = ref(firebaseStorage, `roomDrawings/${activeRoom.id}/${entry.id}.jpg`);
+            await uploadString(storageRef, content, "data_url");
+            const downloadUrl = await getDownloadURL(storageRef);
+            await updateDoc(entryRef, { content: downloadUrl });
+            setState((previous) => ({
+              ...previous,
+              entriesByRoom: {
+                ...previous.entriesByRoom,
+                [activeRoom.id]: mergeRoomEntry(previous.entriesByRoom[activeRoom.id], {
+                  ...entry,
+                  content: downloadUrl,
+                }),
+              },
+            }));
+          } catch (error) {
+            console.error("submitAssignment:storage", error);
+          }
+        }
+        return;
+      }
+
+      patchState((draft) => {
+        draft.entriesByRoom[activeRoom.id] = [
+          ...(draft.entriesByRoom[activeRoom.id] ?? []),
+          makeEntry(
+            activeRoom.id,
+            assignment.chainId,
+            assignment.round,
+            assignment.kind,
+            currentParticipant.id,
+            currentParticipant.displayName,
+            content,
+          ),
+        ];
+
+        return automateAiAndProgress(draft, activeRoom.id);
+      });
+    } catch (error) {
+      console.error("submitAssignment", error);
+      setToast("제출 중 문제가 생겼어요");
+    }
   }
 
   async function sendChatMessage() {
@@ -990,15 +1455,50 @@ export function useMugurigeApp() {
     setComposer("");
   }
 
-  function leaveRoom() {
-    if (isFirebaseMode) {
+  async function leaveRoom() {
+    if (!activeRoom || !currentUser) {
       setActiveRoomId(null);
+      setPendingInviteCode(null);
+      return;
+    }
+
+    if (isFirebaseMode && firebaseDb) {
+      if (activeRoom.hostId === currentUser.id) {
+        await endRoom();
+        return;
+      }
+
+      await deleteDoc(doc(firebaseDb, "rooms", activeRoom.id, "roomParticipants", currentUser.id));
+      setActiveRoomId(null);
+      setPendingInviteCode(null);
+      setToast("방에서 나갔어요");
       return;
     }
 
     patchState((draft) => {
+      if (activeRoom.hostId === currentUser.id) {
+        delete draft.rooms[activeRoom.id];
+        delete draft.participantsByRoom[activeRoom.id];
+        delete draft.entriesByRoom[activeRoom.id];
+        delete draft.messagesByRoom[activeRoom.id];
+        delete draft.sessionsByRoom[activeRoom.id];
+        draft.activeRoomId = null;
+        return draft;
+      }
+
+      draft.participantsByRoom[activeRoom.id] = (draft.participantsByRoom[activeRoom.id] ?? []).filter(
+        (participant) => participant.id !== currentUser.id,
+      );
+      draft.messagesByRoom[activeRoom.id] = [
+        ...(draft.messagesByRoom[activeRoom.id] ?? []),
+        makeChatMessage(activeRoom.id, "system", "Mugurige", `${currentUser.displayName} 님이 방에서 나갔어요.`),
+      ];
       draft.activeRoomId = null;
+      return draft;
     });
+
+    setPendingInviteCode(null);
+    setToast(activeRoom.hostId === currentUser.id ? "방을 종료했어요" : "방에서 나갔어요");
   }
 
   async function copyInviteLink() {
@@ -1031,7 +1531,7 @@ export function useMugurigeApp() {
         updateDoc(doc(firebaseDb, "rooms", activeRoom.id), { status: "lobby" }),
         setDoc(
           doc(collection(firebaseDb, "rooms", activeRoom.id, "chatMessages")),
-          makeChatMessage(activeRoom.id, currentUser.id, "Mugurige", "새 게임을 준비 중이에요. 다시 시작해 볼까요?"),
+          makeChatMessage(activeRoom.id, "system", "Mugurige", "새 게임을 준비 중이에요. 다시 시작해 볼까요?"),
         ),
       ]);
       return;
@@ -1069,6 +1569,7 @@ export function useMugurigeApp() {
       ]);
       await deleteDoc(doc(firebaseDb, "rooms", activeRoom.id));
       setActiveRoomId(null);
+      setPendingInviteCode(null);
       setToast("방을 종료하고 데이터를 정리했어요");
       return;
     }
@@ -1081,6 +1582,7 @@ export function useMugurigeApp() {
       delete draft.sessionsByRoom[activeRoom.id];
       draft.activeRoomId = null;
     });
+    setPendingInviteCode(null);
     setToast("방을 종료하고 데이터를 정리했어요");
   }
 
@@ -1095,6 +1597,7 @@ export function useMugurigeApp() {
     firebaseConfigured,
     isFirebaseMode,
     joinCode,
+    nicknameDraft,
     messages,
     participants,
     session,
@@ -1106,13 +1609,15 @@ export function useMugurigeApp() {
     leaveRoom,
     restartRoom,
     endRoom,
+    saveNickname,
     sendChatMessage,
     setComposer,
     setJoinCode,
+    setNicknameDraft,
     signIn,
     signOut,
     startGame,
     submitTextAssignment,
-    updateRoundLimit,
+    updatePromptDifficulty,
   };
 }

@@ -3,9 +3,12 @@ import type { UserProfile } from "../types";
 interface PortalPanelProps {
   currentUser: UserProfile | null;
   joinCode: string;
+  nicknameDraft: string;
   portalMode: "menu" | "create" | "join";
   onJoinCodeChange: (value: string) => void;
   onJoinRoom: () => void;
+  onNicknameDraftChange: (value: string) => void;
+  onSaveNickname: () => void;
   onSelectCreate: () => void;
   onSelectJoin: () => void;
 }
@@ -13,9 +16,12 @@ interface PortalPanelProps {
 export function PortalPanel({
   currentUser,
   joinCode,
+  nicknameDraft,
   portalMode,
   onJoinCodeChange,
   onJoinRoom,
+  onNicknameDraftChange,
+  onSaveNickname,
   onSelectCreate,
   onSelectJoin,
 }: PortalPanelProps) {
@@ -25,6 +31,25 @@ export function PortalPanel({
         <span className="eyebrow">Start Page</span>
         <h2>방 만들기 / 참가하기</h2>
       </div>
+      {currentUser ? (
+        <div className="nickname-panel">
+          <div className="nickname-copy">
+            <strong>내 닉네임</strong>
+            <p>게임 안에서 보이는 이름이에요.</p>
+          </div>
+          <div className="nickname-form">
+            <input
+              value={nicknameDraft}
+              onChange={(event) => onNicknameDraftChange(event.target.value)}
+              placeholder="닉네임 입력"
+              maxLength={18}
+            />
+            <button className="secondary-button" onClick={onSaveNickname}>
+              저장
+            </button>
+          </div>
+        </div>
+      ) : null}
       <div className="portal-choice-grid">
         <button className={`portal-card ${portalMode === "create" ? "portal-card-active" : ""}`} onClick={onSelectCreate}>
           <strong>방 만들기</strong>

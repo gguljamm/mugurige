@@ -1,13 +1,20 @@
-import { useEffect, useRef, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
+
+export interface DrawingPadHandle {
+  submit: () => void;
+}
 
 interface DrawingPadProps {
   disabled?: boolean;
   onSubmit: (imageDataUrl: string) => void;
 }
 
-export function DrawingPad({ disabled = false, onSubmit }: DrawingPadProps) {
+export const DrawingPad = forwardRef<DrawingPadHandle, DrawingPadProps>(function DrawingPad(
+  { disabled = false, onSubmit }: DrawingPadProps,
+  ref,
+) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const [drawing, setDrawing] = useState(false);
+  const drawingRef = useRef(false);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -42,6 +49,7 @@ export function DrawingPad({ disabled = false, onSubmit }: DrawingPadProps) {
     if (disabled) {
       return;
     }
+    event.preventDefault();
 
     const context = canvasRef.current?.getContext("2d");
     if (!context) {
@@ -51,13 +59,17 @@ export function DrawingPad({ disabled = false, onSubmit }: DrawingPadProps) {
     const point = pointFromEvent(event);
     context.beginPath();
     context.moveTo(point.x, point.y);
-    setDrawing(true);
+    context.lineTo(point.x, point.y);
+    context.stroke();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    drawingRef.current = true;
   }
 
   function handlePointerMove(event: React.PointerEvent<HTMLCanvasElement>) {
-    if (!drawing || disabled) {
+    if (!drawingRef.current || disabled) {
       return;
     }
+    event.preventDefault();
 
     const context = canvasRef.current?.getContext("2d");
     if (!context) {
@@ -69,8 +81,11 @@ export function DrawingPad({ disabled = false, onSubmit }: DrawingPadProps) {
     context.stroke();
   }
 
-  function handlePointerUp() {
-    setDrawing(false);
+  function handlePointerUp(event?: React.PointerEvent<HTMLCanvasElement>) {
+    drawingRef.current = false;
+    if (event) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
   }
 
   function clearCanvas() {
@@ -86,11 +101,17 @@ export function DrawingPad({ disabled = false, onSubmit }: DrawingPadProps) {
   }
 
   function submitCanvas() {
-    const imageData = canvasRef.current?.toDataURL("image/png");
+    const imageData = canvasRef.current?.toDataURL("image/jpeg", 0.72);
     if (imageData) {
       onSubmit(imageData);
     }
   }
+
+  useImperativeHandle(ref, () => ({
+    submit() {
+      submitCanvas();
+    },
+  }));
 
   return (
     <div className="drawing-pad">
@@ -98,19 +119,18 @@ export function DrawingPad({ disabled = false, onSubmit }: DrawingPadProps) {
         ref={canvasRef}
         width={640}
         height={420}
+        draggable={false}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
         onPointerLeave={handlePointerUp}
       />
       <div className="drawing-actions">
         <button className="secondary-button" onClick={clearCanvas} disabled={disabled}>
           전체 지우기
         </button>
-        <button className="primary-button" onClick={submitCanvas} disabled={disabled}>
-          그림 제출
-        </button>
       </div>
     </div>
   );
-}
+});
