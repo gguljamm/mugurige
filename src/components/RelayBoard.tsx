@@ -10,7 +10,7 @@ interface RelayBoardProps {
   isFullscreenPlay?: boolean;
   session: PersistedState["sessionsByRoom"][string] | null;
   state: PersistedState;
-  submitTextAssignment: (value: string) => void;
+  submitTextAssignment: (value: string | Blob) => void;
 }
 
 export function RelayBoard({
@@ -35,8 +35,14 @@ export function RelayBoard({
   const [selectedChainId, setSelectedChainId] = useState<string | null>(currentUserId ?? revealChains[0]?.starter.id ?? null);
   const [remainingSec, setRemainingSec] = useState<number>(session?.stageDurationSec ?? 0);
   const [textDraft, setTextDraft] = useState("");
+  const [lockedStageKey, setLockedStageKey] = useState<string | null>(null);
   const autoSubmittedStageRef = useRef<string | null>(null);
   const drawingPadRef = useRef<DrawingPadHandle | null>(null);
+  const isStageExpired = Boolean(session && remainingSec <= 0 && Date.now() >= stageExpiresAt);
+  const isInputLocked =
+    activeAssignmentHasCurrentEntry
+    || isStageExpired
+    || Boolean(activeAssignmentKey && lockedStageKey === activeAssignmentKey);
 
   useEffect(() => {
     if (!selectedChainId || !revealChains.some((chain) => chain.starter.id === selectedChainId)) {
@@ -62,6 +68,7 @@ export function RelayBoard({
 
   useEffect(() => {
     autoSubmittedStageRef.current = null;
+    setLockedStageKey(null);
     setTextDraft(activeAssignmentKind === "guess" ? activeAssignmentCurrentContent : "");
     if (!activeAssignmentKey) {
       return;
@@ -82,6 +89,7 @@ export function RelayBoard({
     }
 
     autoSubmittedStageRef.current = activeAssignmentKey;
+    setLockedStageKey(activeAssignmentKey);
     if (activeAssignmentKind === "guess") {
       submitTextAssignment(textDraft);
       return;
@@ -195,6 +203,7 @@ export function RelayBoard({
                 onChange={(event) => setTextDraft(event.target.value)}
                 placeholder="이 그림을 한 단어 또는 짧은 문장으로 표현해 주세요"
                 className="prompt-box"
+                disabled={isInputLocked}
                 rows={4}
               />
             </div>
@@ -205,6 +214,7 @@ export function RelayBoard({
               <DrawingPad
                 ref={drawingPadRef}
                 key={`${activeAssignment.chainId}-${activeAssignment.round}`}
+                disabled={isInputLocked}
                 onSubmit={submitTextAssignment}
               />
             </>

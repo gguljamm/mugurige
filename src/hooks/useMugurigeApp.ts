@@ -16,7 +16,7 @@ import {
 } from "firebase/firestore";
 import { httpsCallable } from "firebase/functions";
 import { onAuthStateChanged, signInWithPopup, signOut as firebaseSignOut } from "firebase/auth";
-import { getDownloadURL, ref, uploadString } from "firebase/storage";
+import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
 import {
   ensureMonthlyCredits,
   getAssigneeForRound,
@@ -140,6 +140,15 @@ function mergeRoomEntry(
 ) {
   const merged = [...(previousEntries ?? []).filter((entry) => entry.id !== nextEntry.id), nextEntry];
   return merged.sort((a, b) => a.round - b.round || a.createdAt - b.createdAt);
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => resolve(String(reader.result ?? "")));
+    reader.addEventListener("error", () => reject(reader.error));
+    reader.readAsDataURL(blob);
+  });
 }
 
 function automateAiAndProgress(source: PersistedState, roomId: string): PersistedState {
@@ -1353,7 +1362,7 @@ export function useMugurigeApp() {
     }
   }
 
-  async function submitTextAssignment(content: string) {
+  async function submitTextAssignment(content: string | Blob) {
     if (!activeRoom || !currentParticipant || assignments.length === 0) {
       return;
     }
@@ -1366,6 +1375,17 @@ export function useMugurigeApp() {
 
     try {
       if (isFirebaseMode && firebaseDb) {
+        let entryContent = typeof content === "string" ? content : "";
+        if (assignment.kind === "drawing" && content instanceof Blob) {
+          if (firebaseStorage) {
+            const storageRef = ref(firebaseStorage, `roomDrawings/${activeRoom.id}/${entryDocId(assignment.chainId, assignment.round)}.jpg`);
+            await uploadBytes(storageRef, content, { contentType: content.type || "image/jpeg" });
+            entryContent = await getDownloadURL(storageRef);
+          } else {
+            entryContent = await blobToDataUrl(content);
+          }
+        }
+
         const entry = makeEntry(
           activeRoom.id,
           assignment.chainId,
@@ -1373,7 +1393,7 @@ export function useMugurigeApp() {
           assignment.kind,
           currentParticipant.id,
           currentParticipant.displayName,
-          content,
+          entryContent,
           entryDocId(assignment.chainId, assignment.round),
         );
         const entryRef = doc(firebaseDb, "rooms", activeRoom.id, "entries", entry.id);
@@ -1386,29 +1406,10 @@ export function useMugurigeApp() {
           },
         }));
         await processFirebaseRoom(activeRoom.id);
-
-        if (assignment.kind === "drawing" && firebaseStorage) {
-          try {
-            const storageRef = ref(firebaseStorage, `roomDrawings/${activeRoom.id}/${entry.id}.jpg`);
-            await uploadString(storageRef, content, "data_url");
-            const downloadUrl = await getDownloadURL(storageRef);
-            await updateDoc(entryRef, { content: downloadUrl });
-            setState((previous) => ({
-              ...previous,
-              entriesByRoom: {
-                ...previous.entriesByRoom,
-                [activeRoom.id]: mergeRoomEntry(previous.entriesByRoom[activeRoom.id], {
-                  ...entry,
-                  content: downloadUrl,
-                }),
-              },
-            }));
-          } catch (error) {
-            console.error("submitAssignment:storage", error);
-          }
-        }
         return;
       }
+
+      const entryContent = typeof content === "string" ? content : await blobToDataUrl(content);
 
       patchState((draft) => {
         draft.entriesByRoom[activeRoom.id] = [
@@ -1420,7 +1421,7 @@ export function useMugurigeApp() {
             assignment.kind,
             currentParticipant.id,
             currentParticipant.displayName,
-            content,
+            entryContent,
           ),
         ];
 

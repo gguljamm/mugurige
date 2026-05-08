@@ -33,7 +33,7 @@ export function RoomPanel({
   }
 
   const isHost = currentUser?.id === activeRoom.hostId;
-  const maxParticipants = 8;
+  const maxParticipants = 10;
   const emptySlots = Array.from({ length: Math.max(0, maxParticipants - participants.length) }, (_, index) => index);
   const title =
     activeRoom.status === "playing"

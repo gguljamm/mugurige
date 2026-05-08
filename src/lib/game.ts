@@ -440,5 +440,5 @@ export function getStageDurationSeconds(round: number): number {
     return 5;
   }
 
-  return getStageKind(round) === "drawing" ? 30 : 10;
+  return getStageKind(round) === "drawing" ? 40 : 15;
 }

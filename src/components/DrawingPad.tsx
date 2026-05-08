@@ -6,7 +6,7 @@ export interface DrawingPadHandle {
 
 interface DrawingPadProps {
   disabled?: boolean;
-  onSubmit: (imageDataUrl: string) => void;
+  onSubmit: (imageBlob: Blob) => void;
 }
 
 export const DrawingPad = forwardRef<DrawingPadHandle, DrawingPadProps>(function DrawingPad(
@@ -34,6 +34,12 @@ export const DrawingPad = forwardRef<DrawingPadHandle, DrawingPadProps>(function
     context.lineWidth = 5;
     context.strokeStyle = "#111827";
   }, []);
+
+  useEffect(() => {
+    if (disabled) {
+      drawingRef.current = false;
+    }
+  }, [disabled]);
 
   function pointFromEvent(event: React.PointerEvent<HTMLCanvasElement>) {
     const rect = event.currentTarget.getBoundingClientRect();
@@ -89,6 +95,10 @@ export const DrawingPad = forwardRef<DrawingPadHandle, DrawingPadProps>(function
   }
 
   function clearCanvas() {
+    if (disabled) {
+      return;
+    }
+
     const canvas = canvasRef.current;
     const context = canvas?.getContext("2d");
     if (!canvas || !context) {
@@ -101,10 +111,20 @@ export const DrawingPad = forwardRef<DrawingPadHandle, DrawingPadProps>(function
   }
 
   function submitCanvas() {
-    const imageData = canvasRef.current?.toDataURL("image/jpeg", 0.72);
-    if (imageData) {
-      onSubmit(imageData);
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      return;
     }
+
+    canvas.toBlob(
+      (imageBlob) => {
+        if (imageBlob) {
+          onSubmit(imageBlob);
+        }
+      },
+      "image/jpeg",
+      0.78,
+    );
   }
 
   useImperativeHandle(ref, () => ({
