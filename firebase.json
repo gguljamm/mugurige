@@ -9,6 +9,7 @@
     "source": "functions"
   },
   "hosting": {
+    "site": "mugurige",
     "public": "dist",
     "ignore": ["firebase.json", "**/.*", "**/node_modules/**"]
   }
